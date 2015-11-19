@@ -1,0 +1,10 @@
+message Message {
+    enum Type {
+        COMMAND = 1;
+        MESSAGE = 2;
+    }
+
+    required Type type = 2;
+    required string text = 3;
+    optional string author = 4;
+}
