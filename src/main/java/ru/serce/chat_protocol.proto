@@ -5,6 +5,6 @@ message Message {
     }
 
     required Type type = 2;
-    required string text = 3;
+    repeated string text = 3;
     optional string author = 4;
 }

@@ -1,3 +1,5 @@
+package ru.serce;
+
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
@@ -42,7 +44,7 @@ public class ChannelClient {
                             p.addLast(new SimpleChannelInboundHandler<ChatProtocol.Message>() {
                                 @Override
                                 protected void messageReceived(ChannelHandlerContext ctx, ChatProtocol.Message msg) throws Exception {
-                                    System.out.printf("%s: %s%n", msg.getAuthor(), msg.getText());
+                                    System.out.printf("%s: %s%n", msg.getAuthor(), msg.getTextList());
                                 }
                             });
                         }
@@ -57,7 +59,7 @@ public class ChannelClient {
                 ch.writeAndFlush(ChatProtocol.Message.newBuilder()
                         .setType(ChatProtocol.Message.Type.MESSAGE)
                         .setAuthor(Thread.currentThread().getName())
-                        .setText(msg)
+                        .addText(msg)
                         .build());
             }
         } finally {

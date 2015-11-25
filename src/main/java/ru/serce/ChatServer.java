@@ -1,3 +1,5 @@
+package ru.serce;
+
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -13,8 +15,6 @@ import io.netty.handler.codec.protobuf.ProtobufDecoder;
 import io.netty.handler.codec.protobuf.ProtobufEncoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32LengthFieldPrepender;
-import io.netty.handler.logging.LogLevel;
-import io.netty.handler.logging.LoggingHandler;
 import io.netty.util.concurrent.GlobalEventExecutor;
 
 /**
@@ -48,8 +48,12 @@ public class ChatServer {
                                 }
 
                                 @Override
+                                public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+                                    channels.remove(ctx.channel());
+                                }
+
+                                @Override
                                 protected void messageReceived(ChannelHandlerContext ctx, ChatProtocol.Message msg) throws Exception {
-                                    System.out.println("Revieved, " + msg);
                                     channels.stream()
                                             .filter(channel -> channel != ctx.channel())
                                             .forEach(chan -> chan.writeAndFlush(msg));
