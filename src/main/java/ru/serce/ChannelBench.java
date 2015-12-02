@@ -34,7 +34,7 @@ public class ChannelBench {
             .addText("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
             .build();
     public static final byte[] coded = new byte[]{16,2,26,36,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,34,4,109,97,105,110};
-    private static int COUNT = 400;
+    private static int COUNT = 1000;
     private static int PER_CONN = 10;
     private static final int NUM = COUNT * PER_CONN * (COUNT - 1);
     private static final AtomicInteger res = new AtomicInteger(NUM);
@@ -81,9 +81,9 @@ public class ChannelBench {
                             p.addLast(new SimpleChannelInboundHandler<ByteBuf>() {
                                 @Override
                                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
-                                    if(!Arrays.equals(coded, msg.array())) {
-                                        throw new RuntimeException("UNEQUAL!");
-                                    }
+//                                    if(!Arrays.equals(coded, msg.array())) {
+//                                        throw new RuntimeException("UNEQUAL!");
+//                                    }
                                     int len = msg.array().length;
                                     if (len != 46)
                                         System.out.println(len);
