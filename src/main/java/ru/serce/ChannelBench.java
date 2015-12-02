@@ -1,13 +1,13 @@
 package ru.serce;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.protobuf.ProtobufDecoder;
 import io.netty.handler.codec.protobuf.ProtobufEncoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32LengthFieldPrepender;
@@ -17,6 +17,7 @@ import ru.serce.ChatProtocol.Message;
 import ru.serce.ChatProtocol.Message.Type;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,9 +33,27 @@ public class ChannelBench {
             .setAuthor(Thread.currentThread().getName())
             .addText("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
             .build();
-    private static int COUNT = 10;
+    public static final byte[] coded = new byte[]{16,2,26,36,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,34,4,109,97,105,110};
+    private static int COUNT = 400;
     private static int PER_CONN = 10;
-    private static CountDownLatch cdl = new CountDownLatch(COUNT * PER_CONN * (COUNT - 1));
+    private static final int NUM = COUNT * PER_CONN * (COUNT - 1);
+    private static final AtomicInteger res = new AtomicInteger(NUM);
+    private static CountDownLatch cdl = new CountDownLatch(NUM);
+
+    static {
+        Thread t = new Thread(() -> {
+            while (true) {
+                System.out.println("GET " + res.get());
+                try {
+                    Thread.sleep(1000L);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+    }
 
     public static void main(String[] args) throws IOException, InterruptedException {
         EventLoopGroup group = new NioEventLoopGroup();
@@ -45,19 +64,37 @@ public class ChannelBench {
                     .handler(new ChannelInitializer<SocketChannel>() {
 
                         @Override
+                        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                            cause.printStackTrace();
+                            ctx.close();
+                        }
+
+                        @Override
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline p = ch.pipeline();
 
                             p.addLast(new ProtobufVarint32FrameDecoder());
-                            p.addLast(new ProtobufDecoder(ChatProtocol.Message.getDefaultInstance()));
 
                             p.addLast(new ProtobufVarint32LengthFieldPrepender());
                             p.addLast(new ProtobufEncoder());
 
-                            p.addLast(new SimpleChannelInboundHandler<ChatProtocol.Message>() {
+                            p.addLast(new SimpleChannelInboundHandler<ByteBuf>() {
                                 @Override
-                                protected void messageReceived(ChannelHandlerContext ctx, ChatProtocol.Message msg) throws Exception {
+                                protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
+                                    if(!Arrays.equals(coded, msg.array())) {
+                                        throw new RuntimeException("UNEQUAL!");
+                                    }
+                                    int len = msg.array().length;
+                                    if (len != 46)
+                                        System.out.println(len);
+                                    res.decrementAndGet();
                                     cdl.countDown();
+                                }
+
+                                @Override
+                                public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                                    cause.printStackTrace();
+                                    ctx.close();
                                 }
                             });
                         }
@@ -83,13 +120,16 @@ public class ChannelBench {
                         });
             }
             connected.await();
+            Thread.sleep(2500L);
             long start = System.nanoTime();
             for (int i = 0; i < PER_CONN; i++) {
                 channels.writeAndFlush(MESSAGE);
             }
             cdl.await();
             long end = System.nanoTime();
-            System.out.println("TIME " + TimeUnit.NANOSECONDS.toMillis(end - start) + " ms");
+            long millis = TimeUnit.NANOSECONDS.toMillis(end - start);
+            System.out.println("TIME " + millis + " ms");
+            System.out.println("MES/PER SEC = " +  1000 * COUNT * PER_CONN / (double)millis);
         } finally {
             group.shutdownGracefully();
         }

@@ -43,7 +43,7 @@ public class ChannelClient {
 
                             p.addLast(new SimpleChannelInboundHandler<ChatProtocol.Message>() {
                                 @Override
-                                protected void messageReceived(ChannelHandlerContext ctx, ChatProtocol.Message msg) throws Exception {
+                                protected void channelRead0(ChannelHandlerContext ctx, ChatProtocol.Message msg) throws Exception {
                                     System.out.printf("%s: %s%n", msg.getAuthor(), msg.getTextList());
                                 }
                             });
