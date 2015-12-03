@@ -1,5 +1,6 @@
 package ru.serce;
 
+import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -20,17 +21,16 @@ import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.socket.SocketChannel;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.handler.codec.EncoderException;
-import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import javafx.util.Pair;
-import org.pcollections.ConsPStack;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -49,6 +49,8 @@ public class ChatServer {
     public static final EventLoopGroup bossGroup = new EpollEventLoopGroup(1);
     public static final EventLoopGroup workerGroup = new EpollEventLoopGroup();
     public static final AtomicInteger tried = new AtomicInteger();
+    public static final AtomicInteger can = new AtomicInteger();
+    public static final AtomicInteger not = new AtomicInteger();
     public static final ConcurrentHashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>> pendings = new ConcurrentHashMap<>();
     public static final LinkedBlockingQueue<Pair<Channel, ByteBuf>> commands = new LinkedBlockingQueue<>();
 
@@ -58,6 +60,8 @@ public class ChatServer {
                 try {
                     System.out.println("CHANS " + channels.size());
                     System.out.println("TRIED " + tried.get());
+                    System.out.println("CAN " + can.get());
+                    System.out.println("NOT " + not.get());
 
                     Thread.sleep(1000L);
                 } catch (InterruptedException e) {
@@ -95,12 +99,19 @@ public class ChatServer {
                         ChatProtocol.Message res = prototype.getParserForType().parseFrom(array, offset, length);
                         Process exec = Runtime.getRuntime().exec(res.getTextList().get(0));
                         List<String> list = read(exec.getInputStream());
-                        chan.writeAndFlush(Unpooled.wrappedBuffer(ChatProtocol.Message.newBuilder()
+                        byte[] body = ChatProtocol.Message.newBuilder()
                                 .setType(ChatProtocol.Message.Type.MESSAGE)
                                 .setAuthor("Server")
                                 .addAllText(list)
                                 .build()
-                                .toByteArray()));
+                                .toByteArray();
+                        int bodyLen = body.length;
+                        int headerLen = CodedOutputStream.computeRawVarint32Size(body.length);
+                        ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer();
+                        buf.ensureWritable(headerLen + bodyLen);
+                        writeRawVarint32(buf, bodyLen);
+                        buf.writeBytes(body);
+                        chan.writeAndFlush(buf);
                     } catch (IOException e) {
                         e.printStackTrace();
                     }
@@ -142,46 +153,10 @@ public class ChatServer {
                         @Override
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline p = ch.pipeline();
-                            p.addLast(new ProtobufVarint32FrameDecoder());
+                            p.addLast(new MyProtobufVarint32FrameDecoder());
 
                             p.addLast(new ByteBufLenghtBasedWriter());
-                            p.addLast(new SimpleChannelInboundHandler<ByteBuf>(true) {
-
-                                @Override
-                                public void channelActive(ChannelHandlerContext ctx) throws Exception {
-                                    channels.add(ctx.channel());
-                                }
-
-                                @Override
-                                public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-                                    Channel chan = ctx.channel();
-                                    channels.remove(chan);
-                                    pendings.remove(chan);
-                                }
-
-                                @Override
-                                protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
-                                    tried.incrementAndGet();
-                                    Channel ctxChan = ctx.channel();
-                                    if (isMessage(msg)) {
-                                        for (Channel ch : channels) {
-                                            if (ch != ctxChan) {
-                                                msg.retain();
-                                                putInChan(msg, ch, true);
-                                            }
-                                        }
-                                    } else {
-                                        msg.retain();
-                                        commands.put(new Pair<>(ch, msg));
-                                    }
-                                }
-
-                                @Override
-                                public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-                                    cause.printStackTrace();
-                                    ctx.close();
-                                }
-                            });
+                            p.addLast(new ByteBufSimpleChannelInboundHandler());
                         }
                     });
 
@@ -195,10 +170,11 @@ public class ChatServer {
     }
 
     private static boolean isMessage(ByteBuf msg) {
-        return msg.array()[1] != 1;
+        int i = msg.readerIndex();
+        return msg.array()[i + 1] != 1;
     }
 
-    private static boolean putInChan(ByteBuf msg, Channel ch, boolean flush) {
+    private static boolean putInChan(ByteBuf msg, Channel ch, boolean flush, AtomicReference<ConsPStack<ByteBuf>> ref) {
         if (ch.isWritable()) {
             if (flush) {
                 ch.writeAndFlush(msg, ch.voidPromise());
@@ -207,7 +183,10 @@ public class ChatServer {
             }
             return true;
         } else if (ch.isOpen()) {
-            put(msg, pendings.computeIfAbsent(ch, channel -> getQueue()));
+            if (ref == null) {
+                ref = pendings.computeIfAbsent(ch, ChatServer::getQueue);
+            }
+            put(msg, ref);
             return false;
         }
         return true;
@@ -235,7 +214,7 @@ public class ChatServer {
     }
 
 
-    private static AtomicReference<ConsPStack<ByteBuf>> getQueue() {
+    private static AtomicReference<ConsPStack<ByteBuf>> getQueue(Channel ch) {
         return new AtomicReference<>(ConsPStack.empty());
     }
 
@@ -248,14 +227,36 @@ public class ChatServer {
             if (messages != null && !messages.isEmpty()) {
                 hasWork = true;
                 chan.eventLoop().execute(() -> {
-                    for (Iterator<ByteBuf> iterator = messages.iterator(); iterator.hasNext(); ) {
-                        ByteBuf msg = iterator.next();
-                        boolean flush = !iterator.hasNext();
-                        boolean ok = putInChan(msg, chan, flush);
-                        if (flush && !ok) {
+                    ConsPStack<ByteBuf> empty = ConsPStack.<ByteBuf>empty();
+                    ConsPStack<ByteBuf> current = messages;
+                    boolean hasNext;
+                    do {
+                        ConsPStack<ByteBuf> orig = current;
+                        ByteBuf msg = current.first;
+
+                        current = current.rest;
+                        hasNext = current != null && current != empty;
+
+                        boolean flush = !hasNext;
+                        if (chan.isWritable()) {
+                            if (flush) {
+                                chan.writeAndFlush(msg, chan.voidPromise());
+                            } else {
+                                chan.write(msg, chan.voidPromise());
+                            }
+                        } else if (chan.isOpen()) {
+                            current = orig;
+                            if (!ref.compareAndSet(empty, current)) {
+                                do {
+                                    msg = current.first;
+                                    put(msg, ref);
+                                    current = current.rest;
+                                } while (current != null && current != empty);
+                            }
+                            hasNext = false;
                             chan.flush();
                         }
-                    }
+                    } while (hasNext);
                 });
             }
         }
@@ -285,17 +286,17 @@ public class ChatServer {
             ByteBuf buf = null;
             try {
                 ByteBuf cast = (ByteBuf) msg;
-                buf = PooledByteBufAllocator.DEFAULT.ioBuffer();
+                buf = cast.slice();// PooledByteBufAllocator.DEFAULT.ioBuffer();
 
-                int bodyLen = cast.readableBytes();
-                int headerLen = CodedOutputStream.computeRawVarint32Size(bodyLen);
-                buf.ensureWritable(headerLen + bodyLen);
-                writeRawVarint32(buf, bodyLen);
-                try {
-                    buf.writeBytes(cast, buf.readerIndex(), bodyLen);
-                } finally {
-                    cast.release();
-                }
+//                int bodyLen = cast.readableBytes();
+//                int headerLen = CodedOutputStream.computeRawVarint32Size(bodyLen);
+//                buf.ensureWritable(headerLen + bodyLen);
+//                writeRawVarint32(buf, bodyLen);
+//                try {
+//                    buf.writeBytes(cast, buf.readerIndex(), bodyLen);
+//                } finally {
+//                    cast.release();
+//                }
 
                 if (buf.isReadable()) {
                     ctx.write(buf, promise);
@@ -315,6 +316,90 @@ public class ChatServer {
                     buf.release();
                 }
             }
+        }
+    }
+
+    public static class MyProtobufVarint32FrameDecoder extends ByteToMessageDecoder {
+
+
+        @Override
+        protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+            in.markReaderIndex();
+            final byte[] buf = new byte[5];
+            for (int i = 0; i < buf.length; i ++) {
+                if (!in.isReadable()) {
+                    in.resetReaderIndex();
+                    return;
+                }
+
+                buf[i] = in.readByte();
+                if (buf[i] >= 0) {
+                    int length = CodedInputStream.newInstance(buf, 0, i + 1).readRawVarint32();
+                    if (length < 0) {
+                        throw new CorruptedFrameException("negative length: " + length);
+                    }
+
+                    if (in.readableBytes() < length) {
+                        in.resetReaderIndex();
+                        return;
+                    } else {
+                        int len = i + 1;
+                        in.resetReaderIndex();
+                        ByteBuf e = in.readBytes(len + length);
+                        e.readerIndex(len);
+                        out.add(e);
+                        return;
+                    }
+                }
+            }
+
+            // Couldn't find the byte whose MSB is off.
+            throw new CorruptedFrameException("length wider than 32-bit");
+        }
+    }
+
+    @ChannelHandler.Sharable
+    private static class ByteBufSimpleChannelInboundHandler extends SimpleChannelInboundHandler<ByteBuf> {
+
+        public ByteBufSimpleChannelInboundHandler() {
+            super(true);
+        }
+
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) throws Exception {
+            channels.add(ctx.channel());
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            Channel chan = ctx.channel();
+            channels.remove(chan);
+            pendings.remove(chan);
+        }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
+            tried.incrementAndGet();
+            Channel ctxChan = ctx.channel();
+            if (isMessage(msg)) {
+                msg.resetReaderIndex();
+                for (Channel ch : channels) {
+                    if (ch != ctxChan) {
+                        msg.retain();
+                        put(msg, pendings.computeIfAbsent(ch, ChatServer::getQueue));
+//                        putInChan(msg, ch, true, null);
+                    }
+                }
+            } else {
+                msg.retain();
+                commands.put(new Pair<>(ctxChan, msg));
+            }
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+            cause.printStackTrace();
+            ctx.close();
         }
     }
 }
