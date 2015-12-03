@@ -25,12 +25,14 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.handler.codec.EncoderException;
 import io.netty.util.concurrent.GlobalEventExecutor;
+import io.netty.util.internal.SystemPropertyUtil;
 import javafx.util.Pair;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -51,7 +53,7 @@ public class ChatServer {
     public static final AtomicInteger tried = new AtomicInteger();
     public static final AtomicInteger can = new AtomicInteger();
     public static final AtomicInteger not = new AtomicInteger();
-    public static final ConcurrentHashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>> pendings = new ConcurrentHashMap<>();
+    public static final ThreadLocal<HashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>>> pendings = new ThreadLocal<>().withInitial(HashMap::new);
     public static final LinkedBlockingQueue<Pair<Channel, ByteBuf>> commands = new LinkedBlockingQueue<>();
 
     static {
@@ -160,8 +162,11 @@ public class ChatServer {
                         }
                     });
 
-            workerGroup.schedule(ChatServer::handlePendings, 0, TimeUnit.MILLISECONDS);
-
+            int DEFAULT_EVENT_LOOP_THREADS = Math.max(1, SystemPropertyUtil.getInt(
+                    "io.netty.eventLoopThreads", Runtime.getRuntime().availableProcessors() * 2));
+            for (int i = 0; i < DEFAULT_EVENT_LOOP_THREADS; i++) {
+                workerGroup.schedule(ChatServer::handlePendings, 0, TimeUnit.MILLISECONDS);
+            }
             b.bind(20053).sync().channel().closeFuture().sync();
         } finally {
             bossGroup.shutdownGracefully();
@@ -174,23 +179,23 @@ public class ChatServer {
         return msg.array()[i + 1] != 1;
     }
 
-    private static boolean putInChan(ByteBuf msg, Channel ch, boolean flush, AtomicReference<ConsPStack<ByteBuf>> ref) {
-        if (ch.isWritable()) {
-            if (flush) {
-                ch.writeAndFlush(msg, ch.voidPromise());
-            } else {
-                ch.write(msg, ch.voidPromise());
-            }
-            return true;
-        } else if (ch.isOpen()) {
-            if (ref == null) {
-                ref = pendings.computeIfAbsent(ch, ChatServer::getQueue);
-            }
-            put(msg, ref);
-            return false;
-        }
-        return true;
-    }
+//    private static boolean putInChan(ByteBuf msg, Channel ch, boolean flush, AtomicReference<ConsPStack<ByteBuf>> ref) {
+//        if (ch.isWritable()) {
+//            if (flush) {
+//                ch.writeAndFlush(msg, ch.voidPromise());
+//            } else {
+//                ch.write(msg, ch.voidPromise());
+//            }
+//            return true;
+//        } else if (ch.isOpen()) {
+//            if (ref == null) {
+//                ref = pendings.computeIfAbsent(ch, ChatServer::getQueue);
+//            }
+//            put(msg, ref);
+//            return false;
+//        }
+//        return true;
+//    }
 
     private static void put(ByteBuf msg, AtomicReference<ConsPStack<ByteBuf>> ref) {
         ConsPStack<ByteBuf> oldStack;
@@ -220,7 +225,8 @@ public class ChatServer {
 
     private static void handlePendings() {
         boolean hasWork = false;
-        for (Map.Entry<Channel, AtomicReference<ConsPStack<ByteBuf>>> entry : pendings.entrySet()) {
+        HashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>> tlb = pendings.get();
+        for (Map.Entry<Channel, AtomicReference<ConsPStack<ByteBuf>>> entry : tlb.entrySet()) {
             Channel chan = entry.getKey();
             AtomicReference<ConsPStack<ByteBuf>> ref = entry.getValue();
             ConsPStack<ByteBuf> messages = extract(ref);
@@ -374,19 +380,20 @@ public class ChatServer {
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
             Channel chan = ctx.channel();
             channels.remove(chan);
-            pendings.remove(chan);
+            pendings.get().remove(chan);
         }
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
             tried.incrementAndGet();
+            HashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>> tlb = pendings.get();
             Channel ctxChan = ctx.channel();
             if (isMessage(msg)) {
                 msg.resetReaderIndex();
                 for (Channel ch : channels) {
                     if (ch != ctxChan) {
                         msg.retain();
-                        put(msg, pendings.computeIfAbsent(ch, ChatServer::getQueue));
+                        put(msg, tlb.computeIfAbsent(ch, ChatServer::getQueue));
 //                        putInChan(msg, ch, true, null);
                     }
                 }
