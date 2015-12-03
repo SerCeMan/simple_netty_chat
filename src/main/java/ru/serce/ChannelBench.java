@@ -2,7 +2,13 @@ package ru.serce;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
-import io.netty.channel.*;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -81,9 +87,9 @@ public class ChannelBench {
                             p.addLast(new SimpleChannelInboundHandler<ByteBuf>() {
                                 @Override
                                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
-//                                    if(!Arrays.equals(coded, msg.array())) {
-//                                        throw new RuntimeException("UNEQUAL!");
-//                                    }
+                                    if(!Arrays.equals(coded, msg.array())) {
+                                        throw new RuntimeException("UNEQUAL!");
+                                    }
                                     int len = msg.array().length;
                                     if (len != 46)
                                         System.out.println(len);
@@ -104,7 +110,7 @@ public class ChannelBench {
             CountDownLatch connected = new CountDownLatch(COUNT);
             ChannelGroup channels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
             for (int i = 0; i < COUNT; i++) {
-                b.connect("localhost", 20026)
+                b.connect("localhost", 20053)
                         .addListener(new GenericFutureListener<ChannelFuture>() {
                             @Override
                             public void operationComplete(ChannelFuture future) throws Exception {

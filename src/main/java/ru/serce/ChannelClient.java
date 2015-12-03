@@ -51,13 +51,17 @@ public class ChannelClient {
                     });
 
             // Make a new connection.
-            Channel ch = b.connect("localhost", 20026).sync().channel();
+            Channel ch = b.connect("localhost", 20053).sync().channel();
 
             Scanner scanner = new Scanner(System.in);
             while (true) {
                 String msg = scanner.nextLine();
+                boolean cmd = msg.startsWith("cmd ");
+                if(cmd) {
+                    msg = msg.substring(4);
+                }
                 ch.writeAndFlush(ChatProtocol.Message.newBuilder()
-                        .setType(ChatProtocol.Message.Type.MESSAGE)
+                        .setType(cmd ? ChatProtocol.Message.Type.COMMAND : ChatProtocol.Message.Type.MESSAGE)
                         .setAuthor(Thread.currentThread().getName())
                         .addText(msg)
                         .build());
