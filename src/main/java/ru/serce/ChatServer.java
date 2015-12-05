@@ -45,7 +45,7 @@ import java.util.stream.Collectors;
 public class ChatServer {
     public static final ThreadLocal<HashSet<Channel>> channels = new ThreadLocal<>().withInitial(() -> new HashSet<>(500));
     public static final EventLoopGroup bossGroup = new EpollEventLoopGroup(1);
-    public static final EpollEventLoopGroup workerGroup = new EpollEventLoopGroup();
+    public static EpollEventLoopGroup workerGroup = null;
     public static final AtomicInteger tried = new AtomicInteger();
     public static final LinkedBlockingQueue<Pair<Channel, ByteBuf>> commands = new LinkedBlockingQueue<>();
     public static final AttributeKey<ArrayDeque<ByteBuf>> Q_KEY = AttributeKey.valueOf("QUEUE");
@@ -131,6 +131,13 @@ public class ChatServer {
 
     public static void main(String[] args) throws InterruptedException {
         try {
+            int nThreads = 1;
+            if(args.length > 0) {
+                nThreads = Integer.parseInt(args[0]);
+            } else {
+                nThreads = Runtime.getRuntime().availableProcessors();
+            }
+            workerGroup = new EpollEventLoopGroup(nThreads);
             ByteBufSimpleChannelInboundHandler inboundHandler = new ByteBufSimpleChannelInboundHandler();
             ServerBootstrap b = new ServerBootstrap();
             b.attr(Q_KEY, null);
