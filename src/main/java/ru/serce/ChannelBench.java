@@ -40,8 +40,8 @@ public class ChannelBench {
             .addText("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
             .build();
     public static final byte[] coded = new byte[]{16,2,26,36,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,65,34,4,109,97,105,110};
-    private static int COUNT = 1300;
-    private static int PER_CONN = 10;
+    private static int COUNT = 3500;
+    private static int PER_CONN = 50;
     private static final int NUM = COUNT * PER_CONN * (COUNT - 1);
     private static final AtomicInteger res = new AtomicInteger(NUM);
     private static CountDownLatch cdl = new CountDownLatch(NUM);

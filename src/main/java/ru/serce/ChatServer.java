@@ -18,28 +18,24 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerSocketChannel;
-import io.netty.channel.group.ChannelGroup;
-import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.handler.codec.EncoderException;
-import io.netty.util.concurrent.GlobalEventExecutor;
-import io.netty.util.internal.SystemPropertyUtil;
+import io.netty.util.AttributeKey;
+import io.netty.util.concurrent.EventExecutor;
 import javafx.util.Pair;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.util.HashMap;
+import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 /**
@@ -47,23 +43,20 @@ import java.util.stream.Collectors;
  * @since 20.11.15.
  */
 public class ChatServer {
-    public static final ChannelGroup channels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+    public static final ThreadLocal<HashSet<Channel>> channels = new ThreadLocal<>().withInitial(() -> new HashSet<>(500));
     public static final EventLoopGroup bossGroup = new EpollEventLoopGroup(1);
-    public static final EventLoopGroup workerGroup = new EpollEventLoopGroup();
+    public static final EpollEventLoopGroup workerGroup = new EpollEventLoopGroup();
     public static final AtomicInteger tried = new AtomicInteger();
-    public static final AtomicInteger can = new AtomicInteger();
-    public static final AtomicInteger not = new AtomicInteger();
-    public static final ThreadLocal<HashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>>> pendings = new ThreadLocal<>().withInitial(HashMap::new);
     public static final LinkedBlockingQueue<Pair<Channel, ByteBuf>> commands = new LinkedBlockingQueue<>();
+    public static final AttributeKey<ArrayDeque<ByteBuf>> Q_KEY = AttributeKey.valueOf("QUEUE");
+    public static final int UPPER_LIMIT = 200;
+    public static final int LOWER_LIMIT = 100;
 
     static {
         new Thread(() -> {
             while (true) {
                 try {
-                    System.out.println("CHANS " + channels.size());
                     System.out.println("TRIED " + tried.get());
-                    System.out.println("CAN " + can.get());
-                    System.out.println("NOT " + not.get());
 
                     Thread.sleep(1000L);
                 } catch (InterruptedException e) {
@@ -125,8 +118,6 @@ public class ChatServer {
                         msg.release();
                     }
                 }
-
-
             }
         }).start();
     }
@@ -140,7 +131,9 @@ public class ChatServer {
 
     public static void main(String[] args) throws InterruptedException {
         try {
+            ByteBufSimpleChannelInboundHandler inboundHandler = new ByteBufSimpleChannelInboundHandler();
             ServerBootstrap b = new ServerBootstrap();
+            b.attr(Q_KEY, null);
             b.option(ChannelOption.TCP_NODELAY, true);
             b.group(bossGroup, workerGroup)
                     .channel(EpollServerSocketChannel.class)
@@ -155,17 +148,15 @@ public class ChatServer {
                         @Override
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline p = ch.pipeline();
-                            p.addLast(new MyProtobufVarint32FrameDecoder());
-
-                            p.addLast(new ByteBufLenghtBasedWriter());
-                            p.addLast(new ByteBufSimpleChannelInboundHandler());
+                            MyProtobufVarint32FrameDecoder decoder = new MyProtobufVarint32FrameDecoder();
+                            p.addLast(decoder);
+                            p.addLast(inboundHandler);
                         }
                     });
 
-            int DEFAULT_EVENT_LOOP_THREADS = Math.max(1, SystemPropertyUtil.getInt(
-                    "io.netty.eventLoopThreads", Runtime.getRuntime().availableProcessors() * 2));
-            for (int i = 0; i < DEFAULT_EVENT_LOOP_THREADS; i++) {
-                workerGroup.schedule(ChatServer::handlePendings, 0, TimeUnit.MILLISECONDS);
+
+            for (EventExecutor executor : workerGroup) {
+                executor.schedule(() -> handlePendings(executor, false), 0, TimeUnit.MILLISECONDS);
             }
             b.bind(20053).sync().channel().closeFuture().sync();
         } finally {
@@ -179,97 +170,50 @@ public class ChatServer {
         return msg.array()[i + 1] != 1;
     }
 
-//    private static boolean putInChan(ByteBuf msg, Channel ch, boolean flush, AtomicReference<ConsPStack<ByteBuf>> ref) {
-//        if (ch.isWritable()) {
-//            if (flush) {
-//                ch.writeAndFlush(msg, ch.voidPromise());
-//            } else {
-//                ch.write(msg, ch.voidPromise());
-//            }
-//            return true;
-//        } else if (ch.isOpen()) {
-//            if (ref == null) {
-//                ref = pendings.computeIfAbsent(ch, ChatServer::getQueue);
-//            }
-//            put(msg, ref);
-//            return false;
-//        }
-//        return true;
-//    }
+    private static void handlePendings(EventExecutor executor, boolean once) {
 
-    private static void put(ByteBuf msg, AtomicReference<ConsPStack<ByteBuf>> ref) {
-        ConsPStack<ByteBuf> oldStack;
-        ConsPStack<ByteBuf> newStack;
-        do {
-            oldStack = ref.get();
-            ConsPStack<ByteBuf> stack = oldStack;
-            if (stack == null) {
-                stack = ConsPStack.empty();
-            }
-            newStack = stack.plus(msg);
-        } while (!ref.compareAndSet(oldStack, newStack));
-    }
-
-    private static ConsPStack<ByteBuf> extract(AtomicReference<ConsPStack<ByteBuf>> ref) {
-        ConsPStack<ByteBuf> stack;
-        do {
-            stack = ref.get();
-        } while (!ref.compareAndSet(stack, ConsPStack.empty()));
-        return stack;
-    }
-
-
-    private static AtomicReference<ConsPStack<ByteBuf>> getQueue(Channel ch) {
-        return new AtomicReference<>(ConsPStack.empty());
-    }
-
-    private static void handlePendings() {
         boolean hasWork = false;
-        HashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>> tlb = pendings.get();
-        for (Map.Entry<Channel, AtomicReference<ConsPStack<ByteBuf>>> entry : tlb.entrySet()) {
-            Channel chan = entry.getKey();
-            AtomicReference<ConsPStack<ByteBuf>> ref = entry.getValue();
-            ConsPStack<ByteBuf> messages = extract(ref);
-            if (messages != null && !messages.isEmpty()) {
-                hasWork = true;
-                chan.eventLoop().execute(() -> {
-                    ConsPStack<ByteBuf> empty = ConsPStack.<ByteBuf>empty();
-                    ConsPStack<ByteBuf> current = messages;
-                    boolean hasNext;
+        try {
+            for (Channel chan : channels.get()) {
+                ArrayDeque<ByteBuf> messages = chQueue(chan);
+                if (messages != null && !messages.isEmpty()) {
+                    boolean autoRead = chan.config().isAutoRead();
+
+                    hasWork = true;
+
+                    ByteBuf msg;
+                    boolean empty;
                     do {
-                        ConsPStack<ByteBuf> orig = current;
-                        ByteBuf msg = current.first;
-
-                        current = current.rest;
-                        hasNext = current != null && current != empty;
-
-                        boolean flush = !hasNext;
+                        msg = messages.peek();
+                        int size = messages.size();
+                        boolean flush = size == 1;
+                        if (!autoRead && size < LOWER_LIMIT) {
+                            chan.config().setAutoRead(true);
+                            autoRead = true;
+                        }
                         if (chan.isWritable()) {
                             if (flush) {
                                 chan.writeAndFlush(msg, chan.voidPromise());
                             } else {
                                 chan.write(msg, chan.voidPromise());
                             }
-                        } else if (chan.isOpen()) {
-                            current = orig;
-                            if (!ref.compareAndSet(empty, current)) {
-                                do {
-                                    msg = current.first;
-                                    put(msg, ref);
-                                    current = current.rest;
-                                } while (current != null && current != empty);
-                            }
-                            hasNext = false;
+                            messages.poll();
+                        } else {
                             chan.flush();
                         }
-                    } while (hasNext);
-                });
+                        empty = messages.isEmpty();
+                    } while (!empty && chan.isWritable());
+                }
             }
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-        if (hasWork) {
-            workerGroup.schedule(ChatServer::handlePendings, 0, TimeUnit.MILLISECONDS);
-        } else {
-            workerGroup.schedule(ChatServer::handlePendings, 50, TimeUnit.MILLISECONDS);
+        if (!once) {
+            if (hasWork) {
+                executor.submit(() -> handlePendings(executor, false));
+            } else {
+                executor.schedule(() -> handlePendings(executor, false), 50, TimeUnit.MILLISECONDS);
+            }
         }
     }
 
@@ -291,19 +235,7 @@ public class ChatServer {
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
             ByteBuf buf = null;
             try {
-                ByteBuf cast = (ByteBuf) msg;
-                buf = cast.slice();// PooledByteBufAllocator.DEFAULT.ioBuffer();
-
-//                int bodyLen = cast.readableBytes();
-//                int headerLen = CodedOutputStream.computeRawVarint32Size(bodyLen);
-//                buf.ensureWritable(headerLen + bodyLen);
-//                writeRawVarint32(buf, bodyLen);
-//                try {
-//                    buf.writeBytes(cast, buf.readerIndex(), bodyLen);
-//                } finally {
-//                    cast.release();
-//                }
-
+                buf = (ByteBuf) msg;
                 if (buf.isReadable()) {
                     ctx.write(buf, promise);
                 } else {
@@ -332,7 +264,7 @@ public class ChatServer {
         protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
             in.markReaderIndex();
             final byte[] buf = new byte[5];
-            for (int i = 0; i < buf.length; i ++) {
+            for (int i = 0; i < buf.length; i++) {
                 if (!in.isReadable()) {
                     in.resetReaderIndex();
                     return;
@@ -373,28 +305,30 @@ public class ChatServer {
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
-            channels.add(ctx.channel());
+            channels.get().add(ctx.channel());
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
             Channel chan = ctx.channel();
-            channels.remove(chan);
-            pendings.get().remove(chan);
+            channels.get().remove(chan);
         }
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
             tried.incrementAndGet();
-            HashMap<Channel, AtomicReference<ConsPStack<ByteBuf>>> tlb = pendings.get();
             Channel ctxChan = ctx.channel();
             if (isMessage(msg)) {
                 msg.resetReaderIndex();
-                for (Channel ch : channels) {
-                    if (ch != ctxChan) {
+                for (EventExecutor eventExecutor : workerGroup) {
+                    if (eventExecutor.inEventLoop()) {
+                        handle(msg, ctxChan, eventExecutor);
+                    } else {
                         msg.retain();
-                        put(msg, tlb.computeIfAbsent(ch, ChatServer::getQueue));
-//                        putInChan(msg, ch, true, null);
+                        eventExecutor.submit(() -> {
+                            handle(msg, ctxChan, eventExecutor);
+                            msg.release();
+                        });
                     }
                 }
             } else {
@@ -403,10 +337,37 @@ public class ChatServer {
             }
         }
 
+        private void handle(ByteBuf msg, Channel ctxChan, EventExecutor executor) {
+            boolean handled = false;
+            for (Channel ch : channels.get()) {
+                if (ch != ctxChan) {
+                    msg.retain();
+                    ArrayDeque<ByteBuf> q = chQueue(ch);
+                    if (q.size() > UPPER_LIMIT) {
+                        ch.config().setAutoRead(false);
+                        if(!handled) {
+                            handlePendings(executor, true);
+                            handled = true;
+                        }
+                    }
+                    q.add(msg);
+                }
+            }
+        }
+
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
             cause.printStackTrace();
             ctx.close();
         }
+    }
+
+    private static ArrayDeque<ByteBuf> chQueue(Channel ch) {
+        ArrayDeque<ByteBuf> queue = ch.attr(Q_KEY).get();
+        if (queue == null) {
+            queue = new ArrayDeque<>(100);
+            ch.attr(Q_KEY).set(queue);
+        }
+        return queue;
     }
 }
