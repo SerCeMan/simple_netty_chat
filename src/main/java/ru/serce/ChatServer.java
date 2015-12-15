@@ -5,24 +5,20 @@ import com.google.protobuf.CodedOutputStream;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
-import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
-import io.netty.channel.ChannelPromise;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.CorruptedFrameException;
-import io.netty.handler.codec.EncoderException;
-import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.EventExecutor;
 import javafx.util.Pair;
 
@@ -30,7 +26,6 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -48,9 +43,6 @@ public class ChatServer {
     public static EpollEventLoopGroup workerGroup = null;
     public static final AtomicInteger tried = new AtomicInteger();
     public static final LinkedBlockingQueue<Pair<Channel, ByteBuf>> commands = new LinkedBlockingQueue<>();
-    public static final AttributeKey<ArrayDeque<ByteBuf>> Q_KEY = AttributeKey.valueOf("QUEUE");
-    public static final int UPPER_LIMIT = 200;
-    public static final int LOWER_LIMIT = 100;
 
     static {
         new Thread(() -> {
@@ -132,7 +124,7 @@ public class ChatServer {
     public static void main(String[] args) throws InterruptedException {
         try {
             int nThreads = 1;
-            if(args.length > 0) {
+            if (args.length > 0) {
                 nThreads = Integer.parseInt(args[0]);
             } else {
                 nThreads = Runtime.getRuntime().availableProcessors();
@@ -140,8 +132,9 @@ public class ChatServer {
             workerGroup = new EpollEventLoopGroup(nThreads);
             ByteBufSimpleChannelInboundHandler inboundHandler = new ByteBufSimpleChannelInboundHandler();
             ServerBootstrap b = new ServerBootstrap();
-            b.attr(Q_KEY, null);
-            b.option(ChannelOption.TCP_NODELAY, true);
+            b.option(EpollChannelOption.TCP_CORK, true);
+            b.childOption(ChannelOption.WRITE_BUFFER_LOW_WATER_MARK, 8 * 1024);
+            b.childOption(ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, 16 * 1024);
             b.group(bossGroup, workerGroup)
                     .channel(EpollServerSocketChannel.class)
                     .childHandler(new ChannelInitializer<SocketChannel>() {
@@ -163,7 +156,7 @@ public class ChatServer {
 
 
             for (EventExecutor executor : workerGroup) {
-                executor.schedule(() -> handlePendings(executor, false), 0, TimeUnit.MILLISECONDS);
+                executor.schedule(() -> handlePendings(executor), 0, TimeUnit.MILLISECONDS);
             }
             b.bind(20053).sync().channel().closeFuture().sync();
         } finally {
@@ -177,51 +170,17 @@ public class ChatServer {
         return msg.array()[i + 1] != 1;
     }
 
-    private static void handlePendings(EventExecutor executor, boolean once) {
-
-        boolean hasWork = false;
+    private static void handlePendings(EventExecutor executor) {
         try {
             for (Channel chan : channels.get()) {
-                ArrayDeque<ByteBuf> messages = chQueue(chan);
-                if (messages != null && !messages.isEmpty()) {
-                    boolean autoRead = chan.config().isAutoRead();
-
-                    hasWork = true;
-
-                    ByteBuf msg;
-                    boolean empty;
-                    do {
-                        msg = messages.peek();
-                        int size = messages.size();
-                        boolean flush = size == 1;
-                        if (!autoRead && size < LOWER_LIMIT) {
-                            chan.config().setAutoRead(true);
-                            autoRead = true;
-                        }
-                        if (chan.isWritable()) {
-                            if (flush) {
-                                chan.writeAndFlush(msg, chan.voidPromise());
-                            } else {
-                                chan.write(msg, chan.voidPromise());
-                            }
-                            messages.poll();
-                        } else {
-                            chan.flush();
-                        }
-                        empty = messages.isEmpty();
-                    } while (!empty && chan.isWritable());
+                if(chan.unsafe().outboundBuffer().totalPendingWriteBytes() > 0) {
+                    chan.unsafe().flush();
                 }
             }
         } catch (Exception e) {
             e.printStackTrace();
         }
-        if (!once) {
-            if (hasWork) {
-                executor.submit(() -> handlePendings(executor, false));
-            } else {
-                executor.schedule(() -> handlePendings(executor, false), 50, TimeUnit.MILLISECONDS);
-            }
-        }
+        executor.schedule(() -> handlePendings(executor), 100, TimeUnit.MILLISECONDS);
     }
 
     public static void writeRawVarint32(ByteBuf buf, int value) throws IOException {
@@ -232,34 +191,6 @@ public class ChatServer {
             } else {
                 buf.writeByte((byte) (value & 0x7F) | 0x80);
                 value >>>= 7;
-            }
-        }
-    }
-
-    @ChannelHandler.Sharable
-    private static class ByteBufLenghtBasedWriter extends ChannelOutboundHandlerAdapter {
-        @Override
-        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-            ByteBuf buf = null;
-            try {
-                buf = (ByteBuf) msg;
-                if (buf.isReadable()) {
-                    ctx.write(buf, promise);
-                } else {
-                    buf.release();
-                    ctx.write(Unpooled.EMPTY_BUFFER, promise);
-                }
-                buf = null;
-            } catch (EncoderException e) {
-                e.printStackTrace();
-                throw e;
-            } catch (Throwable e) {
-                e.printStackTrace();
-                throw new EncoderException(e);
-            } finally {
-                if (buf != null) {
-                    buf.release();
-                }
             }
         }
     }
@@ -345,19 +276,13 @@ public class ChatServer {
         }
 
         private void handle(ByteBuf msg, Channel ctxChan, EventExecutor executor) {
-            boolean handled = false;
             for (Channel ch : channels.get()) {
                 if (ch != ctxChan) {
                     msg.retain();
-                    ArrayDeque<ByteBuf> q = chQueue(ch);
-                    if (q.size() > UPPER_LIMIT) {
-                        ch.config().setAutoRead(false);
-                        if(!handled) {
-                            handlePendings(executor, true);
-                            handled = true;
-                        }
+                    ch.unsafe().write(msg, ch.voidPromise());
+                    if (!ch.isWritable()) {
+                        ch.unsafe().flush();
                     }
-                    q.add(msg);
                 }
             }
         }
@@ -369,12 +294,4 @@ public class ChatServer {
         }
     }
 
-    private static ArrayDeque<ByteBuf> chQueue(Channel ch) {
-        ArrayDeque<ByteBuf> queue = ch.attr(Q_KEY).get();
-        if (queue == null) {
-            queue = new ArrayDeque<>(100);
-            ch.attr(Q_KEY).set(queue);
-        }
-        return queue;
-    }
 }
